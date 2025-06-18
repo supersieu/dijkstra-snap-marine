@@ -56,12 +56,14 @@ function snapToNetwork(point, geojson) {
   let minDist = Infinity;
 
   for (const feature of geojson.features) {
-    const lines =
-      feature.geometry.type === "MultiLineString"
-        ? feature.geometry.coordinates
-        : [feature.geometry.coordinates];
-
+    const lines = [];
+    if (feature.geometry.type === "MultiLineString") {
+      lines.push(...feature.geometry.coordinates);
+    } else if (feature.geometry.type === "LineString") {
+      lines.push(feature.geometry.coordinates);
+    }
     for (const coords of lines) {
+      // if (coords.flat(Infinity).includes(point.lng) && coords.flat(Infinity).includes(point.lat)) continue;
       if (!coords || coords.length < 2) continue;
       const line = turf.lineString(coords);
       const snapped = turf.nearestPointOnLine(
@@ -103,10 +105,8 @@ function geojsonToGraph(geojson) {
     }
   }
   const lastCoords = [];
-  const firstCoords = [];
   for (const coords of lines) {
     lastCoords.push(coords[coords.length - 1]);
-    firstCoords.push(coords[0]);
     for (let i = 0; i < coords.length - 1; i++) {
       const a = coords[i];
       const b = coords[i + 1];
@@ -124,38 +124,26 @@ function geojsonToGraph(geojson) {
     }
   }
 
-  lastCoords.forEach((lastCords) => {
-    let closest = firstCoords[0];
-    firstCoords.forEach((firstCords) => {
-      const distance1 = turf.distance(
-        turf.point(lastCords),
-        turf.point(closest),
-        {
-          units: "kilometers",
-        }
-      );
-      const distance2 = turf.distance(
-        turf.point(lastCords),
-        turf.point(firstCords),
-        {
-          units: "kilometers",
-        }
-      );
-      if (distance1 < 3 && distance2 < 3 && distance2 < distance1) {
-        closest = firstCords;
-      }
-    });
-    const distance = turf.distance(turf.point(lastCords), turf.point(closest), {
-      units: "kilometers",
-    });
-    const keyA = coordsKey(lastCords);
-    const keyB = coordsKey(closest);
-    if (!graph[keyA]) graph[keyA] = {};
-    if (!graph[keyB]) graph[keyB] = {};
+  // lastCoords.forEach((lastCords) => {
+  //   let closest = findClosestGraphNode(
+  //     {
+  //       lng: lastCords[0],
+  //       lat: lastCords[1],
+  //     },
+  //     graph
+  //   );
 
-    graph[keyA][keyB] = distance;
-    graph[keyB][keyA] = distance;
-  });
+  //   const distance = turf.distance(turf.point(lastCords), turf.point(closest), {
+  //     units: "kilometers",
+  //   });
+  //   const keyA = coordsKey(lastCords);
+  //   const keyB = coordsKey(closest);
+  //   if (!graph[keyA]) graph[keyA] = {};
+  //   if (!graph[keyB]) graph[keyB] = {};
+
+  //   graph[keyA][keyB] = distance;
+  //   graph[keyB][keyA] = distance;
+  // });
 
   return graph;
 }
@@ -171,6 +159,10 @@ export default function App() {
   const [points, setPoints] = useState([]);
   const [roadNetwork, setRoadNetwork] = useState(null);
   const [routes, setRoutes] = useState([]);
+  const [boundsPolygon, set1] = useState();
+  const [expandedPolygon, set2] = useState();
+  const [failedPairs, setFailedPairs] = useState([]);
+  const [test, setTest] = useState([]);
 
   const handleMapClick = (latlng) => setPoints((prev) => [...prev, latlng]);
 
@@ -180,17 +172,22 @@ export default function App() {
       turf.featureCollection(densified.map((p) => turf.point([p.lng, p.lat])))
     );
     const [minLng, minLat, maxLng, maxLat] = bounds;
-    const margin = 0.05;
+    const margin = 0.075;
     const expandedBounds = [
       minLng - margin,
       minLat - margin,
       maxLng + margin,
       maxLat + margin,
     ];
+    const boundsPolygon = turf.bboxPolygon(bounds);
+    const expandedPolygon = turf.bboxPolygon(expandedBounds);
+    set1(boundsPolygon);
+    set2(expandedPolygon);
     handleDownloadClick(expandedBounds, async (geojson) => {
       setRoadNetwork(geojson);
 
       const graph = geojsonToGraph(geojson);
+      connectCloseGraphNodes(graph, 0.1);
 
       // const snappedCoords = densified.map((p) => snapToNetwork(p, geojson));
       const snappedCoords = densified
@@ -198,17 +195,45 @@ export default function App() {
         .filter(Boolean);
 
       const routeSegments = [];
+      const newFailedPairs = [];
       for (let i = 0; i < snappedCoords.length - 1; i++) {
-        const segmentCoords = extractPathCoords(
-          graph,
-          snappedCoords[i],
-          snappedCoords[i + 1]
-        );
-        if (segmentCoords.length > 1) {
-          routeSegments.push(turf.lineString(segmentCoords));
+        try {
+          const segmentCoords = extractPathCoords(
+            graph,
+            snappedCoords[i],
+            snappedCoords[i + 1]
+          );
+          if (segmentCoords.length > 1) {
+            routeSegments.push(turf.lineString(segmentCoords));
+          }
+        } catch (err) {
+          console.error(
+            "Erreur de chemin entre :",
+            snappedCoords[i],
+            snappedCoords[i + 1]
+          );
+          newFailedPairs.push([snappedCoords[i], snappedCoords[i + 1]]);
         }
       }
+      setFailedPairs(newFailedPairs);
 
+      const test = [];
+
+      for (const fromKey in graph) {
+        const fromCoord = keyToCoords(fromKey);
+        const neighbors = graph[fromKey];
+
+        for (const toKey in neighbors) {
+          const toCoord = keyToCoords(toKey);
+
+          // Pour éviter les doublons, on ne garde qu'une direction (from < to)
+          if (fromKey < toKey) {
+            const line = turf.lineString([fromCoord, toCoord]);
+            test.push(line);
+          }
+        }
+      }
+      setTest(test);
       setRoutes(routeSegments);
     });
   };
@@ -242,6 +267,27 @@ export default function App() {
 
     return densified;
   }
+
+  function connectCloseGraphNodes(graph, maxDistanceKm = 0.1) {
+    const nodeKeys = Object.keys(graph);
+    for (let i = 0; i < nodeKeys.length; i++) {
+      for (let j = i + 1; j < nodeKeys.length; j++) {
+        const aKey = nodeKeys[i];
+        const bKey = nodeKeys[j];
+        const a = keyToCoords(aKey);
+        const b = keyToCoords(bKey);
+        const distance = turf.distance(turf.point(a), turf.point(b), {
+          units: "kilometers",
+        });
+
+        if (distance <= maxDistanceKm) {
+          graph[aKey][bKey] = distance;
+          graph[bKey][aKey] = distance;
+        }
+      }
+    }
+  }
+
   return (
     <div style={{ height: "100vh", width: "100%" }}>
       <MapContainer
@@ -263,6 +309,36 @@ export default function App() {
 
         {routes.map((r, i) => (
           <GeoJSON key={i} data={r} style={{ color: "blue", weight: 4 }} />
+        ))}
+
+        {/* {test.map((r, i) => (
+          <GeoJSON key={i} data={r} style={{ color: "green", weight: 3 }} />
+        ))} */}
+        {/* {boundsPolygon && <GeoJSON data={boundsPolygon} style={{ color: "green", dashArray: "4", weight: 2 }} />} */}
+
+        {/* {expandedPolygon && (
+          <GeoJSON
+            data={expandedPolygon}
+            style={{ color: "red", dashArray: "4", weight: 2 }}
+          />
+        )} */}
+
+        {failedPairs.map(([a, b], i) => (
+          <GeoJSON
+            key={`fail-${i}`}
+            data={turf.lineString([a, b])}
+            style={{ color: "red", dashArray: "4", weight: 3 }}
+          />
+        ))}
+        {failedPairs.flat().map((coord, i) => (
+          <Marker
+            key={`fail-pt-${i}`}
+            position={{ lat: coord[1], lng: coord[0] }}
+            icon={L.divIcon({
+              className: "failed-node",
+              html: `<div style="background:red;border-radius:50%;width:10px;height:10px;"></div>`,
+            })}
+          />
         ))}
       </MapContainer>
 
